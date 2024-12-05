@@ -1,0 +1,148 @@
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Mint, Token, TokenAccount, TransferChecked};
+
+declare_id!("A4EhVk8uvX1aMp6tt9QXE4owWKS5VxmMUZQCUWogkR2h");
+
+#[program]
+pub mod token_swap {
+    use super::*;
+
+    pub fn initialize_offer(
+        ctx: Context<InitializeOffer>,
+        offered_tokens: Pubkey,
+        wanted_tokens: Pubkey,
+        token_wanted_amount: u64,
+    ) -> Result<()> {
+        let offer_account = &mut ctx.accounts.offer_account;
+        offer_account.is_initialized = true;
+        offer_account.maker = ctx.accounts.signer.key();
+        offer_account.offered_tokens = offered_tokens;
+        offer_account.wanted_tokens = wanted_tokens;
+        offer_account.amount = token_wanted_amount;
+
+        msg!("Offer Initialized Successfully!");
+        msg!("Offer Data: {:?}", offer_account);
+
+        Ok(())
+    }
+
+    pub fn swap_tokens(ctx: Context<SwapTokens>, amount: u64) -> Result<()> {
+        let offer_account = &ctx.accounts.offer_account;
+
+        require!(offer_account.is_initialized, SwapError::OfferNotInitialized);
+        require!(
+            amount <= offer_account.amount,
+            SwapError::InsufficientTokens
+        );
+
+        // Transfer tokens from accepter to maker
+        let cpi_accounts_to_maker = TransferChecked {
+            from: ctx.accounts.accepter_vault.to_account_info(),
+            to: ctx.accounts.maker_vault.to_account_info(),
+            mint: ctx.accounts.wanted_mint.to_account_info(),
+            authority: ctx.accounts.accepter.to_account_info(),
+        };
+
+        let cpi_context_to_maker = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts_to_maker,
+        );
+
+        token::transfer_checked(
+            cpi_context_to_maker,
+            amount,
+            ctx.accounts.wanted_mint.decimals,
+        )?;
+
+        // Transfer tokens from maker to accepter
+        let cpi_accounts_to_accepter = TransferChecked {
+            from: ctx.accounts.maker_vault.to_account_info(),
+            to: ctx.accounts.accepter_vault.to_account_info(),
+            mint: ctx.accounts.offered_mint.to_account_info(),
+            authority: ctx.accounts.offer_authority.to_account_info(),
+        };
+
+        let cpi_context_to_accepter = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts_to_accepter,
+        );
+
+        token::transfer_checked(
+            cpi_context_to_accepter,
+            offer_account.amount,
+            ctx.accounts.offered_mint.decimals,
+        )?;
+
+        msg!("Token swapped successfully!");
+        Ok(())
+    }
+}
+
+#[derive(Accounts, Debug)]
+pub struct InitializeOffer<'info> {
+    #[account(
+        init,
+        payer = signer,
+        space = 8 + Offer::LEN,
+        seeds = [b"offer", signer.key().as_ref()],
+        bump
+    )]
+    pub offer_account: Account<'info, Offer>,
+    #[account(mut)]
+    pub signer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct SwapTokens<'info> {
+    #[account(
+        mut,
+        seeds = [b"offer", offer_authority.key().as_ref()],
+        bump = offer_account.bump
+    )]
+    pub offer_account: Account<'info, Offer>,
+    #[account(
+        mut,
+        seeds = [b"maker_vault", offer_authority.key().as_ref()],
+        bump,
+    )]
+    pub maker_vault: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        seeds = [b"accepter_vault", accepter.key().as_ref()],
+        bump
+    )]
+    pub accepter_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub offered_mint: Account<'info, Mint>,
+    #[account(mut)]
+    pub wanted_mint: Account<'info, Mint>,
+    pub offer_authority: Signer<'info>,
+    #[account(mut)]
+    pub accepter: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[account]
+#[derive(Debug)]
+pub struct Offer {
+    pub maker: Pubkey,
+    pub offered_tokens: Pubkey,
+    pub wanted_tokens: Pubkey,
+    pub amount: u64,
+    pub is_initialized: bool,
+    pub bump: u8,
+}
+
+impl Offer {
+    pub const LEN: usize = 32 + 32 + 32 + 8 + 1 + 1; // Pubkeys (32 bytes each), u64 (8 bytes), bool (1 byte), bump (1 byte)
+}
+
+#[error_code]
+pub enum SwapError {
+    #[msg("The offer is not initialized.")]
+    OfferNotInitialized,
+    #[msg("Insufficient tokens for the swap.")]
+    InsufficientTokens,
+}
